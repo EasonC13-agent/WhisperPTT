@@ -61,7 +61,15 @@ swift build -c release
 # Binary at .build/release/WhisperPTT
 ```
 
-### 4. Grant permissions
+### 4. Remove quarantine (unsigned app)
+
+Since this app is not notarized with Apple, macOS will block it. After copying to Applications, run:
+
+```bash
+xattr -cr /Applications/WhisperPTT.app
+```
+
+### 5. Grant permissions
 
 On first launch, macOS will ask for:
 - **Microphone** — needed to record audio
