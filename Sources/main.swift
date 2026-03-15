@@ -22,7 +22,7 @@ struct AppConfig: Codable {
         modelPath: NSHomeDirectory() + "/.whisper-models/ggml-medium.bin",
         language: "zh",
         threads: 6,
-        hotkey: "Ctrl+Option+Space",
+        hotkey: "Ctrl+Option",
         useStreaming: true,
         streamStep: 3000,
         streamLength: 10000
@@ -69,7 +69,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var config = AppConfig.load()
     var isRecording = false
-    var hotKeyRef: EventHotKeyRef?
+    // hotkey handled via flagsChanged monitor
 
     // Batch mode
     var recordProcess: Process?
@@ -401,28 +401,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         keyUp?.post(tap: .cghidEventTap)
     }
 
-    // MARK: - Global Hotkey
+    // MARK: - Global Hotkey (Ctrl+Option only, no extra key needed)
+
+    var flagsMonitor: Any?
 
     func registerHotKey() {
-        var hotKeyID = EventHotKeyID()
-        hotKeyID.signature = OSType(0x57505454)
-        hotKeyID.id = 1
+        // Monitor modifier key changes globally
+        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self = self else { return }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let targetFlags: NSEvent.ModifierFlags = [.control, .option]
 
-        let modifiers: UInt32 = UInt32(controlKey | optionKey)
-        let keyCode: UInt32 = 49  // space
-
-        var ref: EventHotKeyRef?
-        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID,
-                                         GetApplicationEventTarget(), 0, &ref)
-        if status == noErr { hotKeyRef = ref }
-
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                      eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
-            let appDelegate = NSApplication.shared.delegate as! AppDelegate
-            DispatchQueue.main.async { appDelegate.toggleRecording() }
-            return noErr
-        }, 1, &eventType, nil, nil)
+            // Trigger when exactly Ctrl+Option are pressed (no other modifiers)
+            if flags == targetFlags {
+                DispatchQueue.main.async {
+                    self.toggleRecording()
+                }
+            }
+        }
     }
 
     // MARK: - Menu Actions
