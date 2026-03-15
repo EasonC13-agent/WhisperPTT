@@ -6,7 +6,10 @@ struct AppConfig: Codable {
     var modelPath: String
     var language: String
     var threads: Int
-    var hotkey: String  // display only, actual binding is in code
+    var hotkey: String
+    var useStreaming: Bool
+    var streamStep: Int      // ms between transcription steps
+    var streamLength: Int    // ms of audio context per step
 
     static let configURL: URL = {
         let dir = FileManager.default.homeDirectoryForCurrentUser
@@ -19,7 +22,10 @@ struct AppConfig: Codable {
         modelPath: NSHomeDirectory() + "/.whisper-models/ggml-medium.bin",
         language: "zh",
         threads: 6,
-        hotkey: "Ctrl+Option+Space"
+        hotkey: "Ctrl+Option+Space",
+        useStreaming: true,
+        streamStep: 3000,
+        streamLength: 10000
     )
 
     static func load() -> AppConfig {
@@ -63,20 +69,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var config = AppConfig.load()
     var isRecording = false
-    var recordProcess: Process?
-    let wavPath = NSTemporaryDirectory() + "whisper-ptt-recording.wav"
     var hotKeyRef: EventHotKeyRef?
 
+    // Batch mode
+    var recordProcess: Process?
+    let wavPath = NSTemporaryDirectory() + "whisper-ptt-recording.wav"
+
+    // Streaming mode
+    var streamProcess: Process?
+    var streamPipe: Pipe?
+    var streamOutputFile: String = NSTemporaryDirectory() + "whisper-ptt-stream.txt"
+    var accumulatedText = ""
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Menu bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateIcon()
         buildMenu()
-
-        // Register global hotkey: Ctrl+Shift+Space
         registerHotKey()
 
-        // Save default config if none exists
         if !FileManager.default.fileExists(atPath: AppConfig.configURL.path) {
             config.save()
         }
@@ -86,12 +96,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: isRecording ? "mic.fill" : "mic",
                                    accessibilityDescription: "Whisper PTT")
-            // Tint red when recording
-            if isRecording {
-                button.contentTintColor = .systemRed
-            } else {
-                button.contentTintColor = nil
-            }
+            button.contentTintColor = isRecording ? .systemRed : nil
         }
     }
 
@@ -100,17 +105,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Status
         let statusText = isRecording ? "🔴 Recording..." : "⏸ Ready"
-        let statusItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
-        statusItem.isEnabled = false
-        menu.addItem(statusItem)
+        let si = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
+        si.isEnabled = false
+        menu.addItem(si)
 
         menu.addItem(NSMenuItem.separator())
 
         // Toggle recording
-        let toggleTitle = isRecording ? "⏹ Stop & Transcribe" : "🎙️ Start Recording"
+        let toggleTitle = isRecording ? "⏹ Stop & Paste" : "🎙️ Start Recording"
         let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleRecording), keyEquivalent: "")
         toggleItem.target = self
         menu.addItem(toggleItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Mode toggle
+        let modeTitle = config.useStreaming ? "✅ Streaming Mode (real-time)" : "⬜ Streaming Mode (real-time)"
+        let modeItem = NSMenuItem(title: modeTitle, action: #selector(toggleStreamingMode), keyEquivalent: "")
+        modeItem.target = self
+        menu.addItem(modeItem)
+
+        let batchTitle = !config.useStreaming ? "✅ Batch Mode (record → transcribe)" : "⬜ Batch Mode (record → transcribe)"
+        let batchItem = NSMenuItem(title: batchTitle, action: #selector(toggleStreamingMode), keyEquivalent: "")
+        batchItem.target = self
+        menu.addItem(batchItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -123,9 +141,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = model.path
             let modelFile = (model.path as NSString).lastPathComponent
-            if modelFile == currentModelName {
-                item.state = .on
-            }
+            if modelFile == currentModelName { item.state = .on }
             modelMenu.addItem(item)
         }
         if models.isEmpty {
@@ -158,14 +174,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Hotkey info
         let hotkeyItem = NSMenuItem(title: "⌨️ Hotkey: \(config.hotkey)", action: nil, keyEquivalent: "")
         hotkeyItem.isEnabled = false
         menu.addItem(hotkeyItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Quit
         let quitItem = NSMenuItem(title: "Quit Whisper PTT", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -173,28 +187,128 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusItem.menu = menu
     }
 
-    // MARK: - Recording
+    // MARK: - Toggle
 
     @objc func toggleRecording() {
         if isRecording {
-            stopRecording()
+            if config.useStreaming {
+                stopStreaming()
+            } else {
+                stopBatchRecording()
+            }
         } else {
-            startRecording()
+            if config.useStreaming {
+                startStreaming()
+            } else {
+                startBatchRecording()
+            }
         }
     }
 
-    func startRecording() {
+    // MARK: - Streaming Mode
+
+    func startStreaming() {
+        isRecording = true
+        updateIcon()
+        buildMenu()
+        accumulatedText = ""
+
+        NSSound(named: "Tink")?.play()
+
+        // Remove old output file
+        try? FileManager.default.removeItem(atPath: streamOutputFile)
+
+        // Launch whisper-stream with file output
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-stream")
+        process.arguments = [
+            "-m", config.modelPath,
+            "-l", config.language,
+            "-t", "\(config.threads)",
+            "--step", "\(config.streamStep)",
+            "--length", "\(config.streamLength)",
+            "--keep-context",
+            "-f", streamOutputFile
+        ]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        // Read stdout in real-time for live preview
+        streamPipe = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                // Filter out whisper-stream noise lines
+                let lines = text.components(separatedBy: .newlines)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty && !trimmed.hasPrefix("[") && !trimmed.hasPrefix("whisper_") &&
+                       !trimmed.contains("init:") && !trimmed.contains("main:") {
+                        // Don't double-accumulate; file output is canonical
+                    }
+                }
+            }
+        }
+
+        do {
+            try process.run()
+            streamProcess = process
+            showNotification(title: "Whisper PTT", body: "🔴 Streaming... speak now")
+        } catch {
+            showNotification(title: "Whisper PTT", body: "❌ Failed to start whisper-stream")
+            isRecording = false
+            updateIcon()
+            buildMenu()
+        }
+    }
+
+    func stopStreaming() {
+        isRecording = false
+        updateIcon()
+        NSSound(named: "Pop")?.play()
+
+        // Stop whisper-stream
+        streamPipe?.fileHandleForReading.readabilityHandler = nil
+        streamProcess?.terminate()
+        streamProcess?.waitUntilExit()
+        streamProcess = nil
+        streamPipe = nil
+
+        usleep(300_000)
+
+        // Read transcribed text from output file
+        var finalText = ""
+        if let content = try? String(contentsOfFile: streamOutputFile, encoding: .utf8) {
+            finalText = content
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.hasPrefix("[") }
+                .joined()
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        if !finalText.isEmpty {
+            pasteText(finalText)
+            showNotification(title: "Whisper PTT", body: "✅ \(String(finalText.prefix(80)))")
+        } else {
+            showNotification(title: "Whisper PTT", body: "No speech detected")
+        }
+
+        buildMenu()
+    }
+
+    // MARK: - Batch Mode (original)
+
+    func startBatchRecording() {
         isRecording = true
         updateIcon()
         buildMenu()
 
-        // Play start sound
         NSSound(named: "Tink")?.play()
-
-        // Remove old recording
         try? FileManager.default.removeItem(atPath: wavPath)
 
-        // Start sox recording
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/sox")
         process.arguments = ["-d", "-r", "16000", "-c", "1", "-b", "16", wavPath]
@@ -204,19 +318,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         recordProcess = process
     }
 
-    func stopRecording() {
+    func stopBatchRecording() {
         isRecording = false
         updateIcon()
-
-        // Play stop sound
         NSSound(named: "Pop")?.play()
 
-        // Stop sox
         recordProcess?.terminate()
         recordProcess?.waitUntilExit()
         recordProcess = nil
 
-        // Small delay for file flush
         usleep(300_000)
 
         let fm = FileManager.default
@@ -229,9 +339,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         showNotification(title: "Whisper PTT", body: "Transcribing...")
 
-        // Run whisper in background
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let result = self.transcribe()
+            let result = self.transcribeBatch()
             DispatchQueue.main.async {
                 if let text = result, !text.isEmpty {
                     self.pasteText(text)
@@ -246,7 +355,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
-    func transcribe() -> String? {
+    func transcribeBatch() -> String? {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-cli")
@@ -263,31 +372,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try process.run()
             process.waitUntilExit()
-        } catch {
-            return nil
-        }
+        } catch { return nil }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let output = String(data: data, encoding: .utf8) else { return nil }
 
-        let text = output
+        return output
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("[") }
             .joined()
             .trimmingCharacters(in: .whitespaces)
-
-        return text
     }
+
+    // MARK: - Paste
 
     func pasteText(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
-        // Simulate Cmd+V
         let src = CGEventSource(stateID: .hidSystemState)
-        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)  // V key
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
         let keyUp = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
         keyDown?.flags = .maskCommand
         keyUp?.flags = .maskCommand
@@ -295,37 +401,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         keyUp?.post(tap: .cghidEventTap)
     }
 
-    // MARK: - Global Hotkey (Ctrl+Shift+Space)
+    // MARK: - Global Hotkey
 
     func registerHotKey() {
         var hotKeyID = EventHotKeyID()
-        hotKeyID.signature = OSType(0x57505454)  // 'WPTT'
+        hotKeyID.signature = OSType(0x57505454)
         hotKeyID.id = 1
 
-        // Ctrl+Option+Space: modifiers = controlKey | optionKey, keycode = 49 (space)
         let modifiers: UInt32 = UInt32(controlKey | optionKey)
         let keyCode: UInt32 = 49  // space
 
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID,
                                          GetApplicationEventTarget(), 0, &ref)
-        if status == noErr {
-            hotKeyRef = ref
-        }
+        if status == noErr { hotKeyRef = ref }
 
-        // Install handler
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
             let appDelegate = NSApplication.shared.delegate as! AppDelegate
-            DispatchQueue.main.async {
-                appDelegate.toggleRecording()
-            }
+            DispatchQueue.main.async { appDelegate.toggleRecording() }
             return noErr
         }, 1, &eventType, nil, nil)
     }
 
     // MARK: - Menu Actions
+
+    @objc func toggleStreamingMode() {
+        config.useStreaming = !config.useStreaming
+        config.save()
+        buildMenu()
+    }
 
     @objc func selectModel(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
@@ -342,18 +448,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openModelDownload() {
-        // Open HuggingFace whisper.cpp models page
         NSWorkspace.shared.open(URL(string: "https://huggingface.co/ggerganov/whisper.cpp/tree/master")!)
     }
 
     @objc func quitApp() {
         if isRecording {
+            streamProcess?.terminate()
             recordProcess?.terminate()
         }
         NSApplication.shared.terminate(nil)
     }
-
-    // MARK: - Notifications
 
     func showNotification(title: String, body: String) {
         let process = Process()
@@ -365,7 +469,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Main
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // Menu bar only, no dock icon
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
