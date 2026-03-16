@@ -1,6 +1,8 @@
 import Cocoa
 import Carbon.HIToolbox
 
+let APP_VERSION = "1.2.1"
+
 // MARK: - Config
 struct AppConfig: Codable {
     var modelPath: String
@@ -128,7 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         registerHotKey()
 
-        log("App launched")
+        log("App launched — Whisper PTT v\(APP_VERSION)")
 
         // First run setup
         if !config.setupDone {
@@ -539,6 +541,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         logItem.target = self
         menu.addItem(logItem)
 
+        let versionItem = NSMenuItem(title: "Whisper PTT v\(APP_VERSION)", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
         let quitItem = NSMenuItem(title: "Quit Whisper PTT", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -810,6 +816,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Global Hotkey (Ctrl+Option)
 
     var flagsMonitor: Any?
+    var lastToggleTime: Date = .distantPast
 
     func registerHotKey() {
         flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
@@ -817,7 +824,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             let targetFlags: NSEvent.ModifierFlags = [.control, .option]
             if flags == targetFlags {
-                DispatchQueue.main.async { self.toggleRecording() }
+                // Debounce: ignore if triggered within 1 second
+                let now = Date()
+                if now.timeIntervalSince(self.lastToggleTime) < 1.0 { return }
+                self.lastToggleTime = now
+                DispatchQueue.main.async {
+                    self.log("Hotkey triggered (Ctrl+Option), isRecording=\(self.isRecording)")
+                    self.toggleRecording()
+                }
             }
         }
     }
