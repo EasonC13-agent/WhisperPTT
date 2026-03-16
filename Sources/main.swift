@@ -600,6 +600,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let _ = handle.availableData  // drain stdout
         }
 
+        // Capture stderr from whisper-stream for debugging
+        let errPipe = Pipe()
+        process.standardError = errPipe
+
+        // Watch for unexpected termination
+        process.terminationHandler = { [weak self] proc in
+            guard let self = self else { return }
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(data: errData, encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                if self.isRecording {
+                    self.log("whisper-stream died unexpectedly (code \(proc.terminationStatus)): \(stderr.prefix(500))")
+                    self.isRecording = false
+                    self.updateIcon()
+                    self.buildMenu()
+                    self.showNotification(title: "Whisper PTT", body: "❌ whisper-stream crashed. Check mic permissions in System Settings!")
+                }
+            }
+        }
+
         do {
             try process.run()
             streamProcess = process
@@ -676,7 +696,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         process.executableURL = URL(fileURLWithPath: soxPath)
         process.arguments = ["-d", "-r", "16000", "-c", "1", "-b", "16", wavPath]
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        let soxErrPipe = Pipe()
+        process.standardError = soxErrPipe
+
+        process.terminationHandler = { [weak self] proc in
+            guard let self = self else { return }
+            let errData = soxErrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(data: errData, encoding: .utf8) ?? ""
+            DispatchQueue.main.async {
+                if self.isRecording {
+                    self.log("sox died unexpectedly (code \(proc.terminationStatus)): \(stderr.prefix(500))")
+                    self.isRecording = false
+                    self.updateIcon()
+                    self.buildMenu()
+                    self.showNotification(title: "Whisper PTT", body: "❌ Recording failed. Check mic permissions!")
+                }
+            }
+        }
 
         do {
             try process.run()
