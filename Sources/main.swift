@@ -90,6 +90,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !FileManager.default.fileExists(atPath: AppConfig.configURL.path) {
             config.save()
         }
+
+        log("App launched")
+        log("Model path: \(config.modelPath)")
+        log("Model exists: \(FileManager.default.fileExists(atPath: config.modelPath))")
+        log("Streaming: \(config.useStreaming)")
+
+        // Check model on launch
+        if !FileManager.default.fileExists(atPath: config.modelPath) {
+            showNotification(title: "Whisper PTT", body: "⚠️ No model found! Download one to ~/.whisper-models/")
+        }
+    }
+
+    // MARK: - Logging
+    let logFile: URL = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/whisper-ptt")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("whisper-ptt.log")
+    }()
+
+    func log(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        print(line, terminator: "")  // Also print to stdout if run from Terminal
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logFile.path) {
+                if let handle = try? FileHandle(forWritingTo: logFile) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: logFile)
+            }
+        }
     }
 
     func updateIcon() {
@@ -220,12 +255,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Launch whisper-stream with file output
         guard let streamPath = findExecutable("whisper-stream") else {
+            log("ERROR: whisper-stream not found")
             showNotification(title: "Whisper PTT", body: "❌ whisper-stream not found! Run: brew install whisper-cpp")
             isRecording = false
             updateIcon()
             buildMenu()
             return
         }
+
+        if !FileManager.default.fileExists(atPath: config.modelPath) {
+            log("ERROR: model not found at \(config.modelPath)")
+            showNotification(title: "Whisper PTT", body: "❌ Model not found! Download to ~/.whisper-models/")
+            isRecording = false
+            updateIcon()
+            buildMenu()
+            return
+        }
+
+        log("Starting streaming with: \(streamPath)")
+        log("Model: \(config.modelPath)")
 
         let process = Process()
         let pipe = Pipe()
@@ -263,9 +311,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try process.run()
             streamProcess = process
+            log("whisper-stream started (PID: \(process.processIdentifier))")
             showNotification(title: "Whisper PTT", body: "🔴 Streaming... speak now")
         } catch {
-            showNotification(title: "Whisper PTT", body: "❌ Failed to start whisper-stream")
+            log("ERROR starting whisper-stream: \(error)")
+            showNotification(title: "Whisper PTT", body: "❌ Failed to start whisper-stream: \(error.localizedDescription)")
             isRecording = false
             updateIcon()
             buildMenu()
@@ -320,9 +370,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startBatchRecording() {
         guard let soxPath = findExecutable("sox") else {
+            log("ERROR: sox not found")
             showNotification(title: "Whisper PTT", body: "❌ sox not found! Run: brew install sox")
             return
         }
+        log("Starting batch recording with sox: \(soxPath)")
 
         isRecording = true
         updateIcon()
