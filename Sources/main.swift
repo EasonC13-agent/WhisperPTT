@@ -22,7 +22,7 @@ struct AppConfig: Codable {
         modelPath: NSHomeDirectory() + "/.whisper-models/ggml-medium.bin",
         language: "zh",
         threads: 6,
-        hotkey: "Ctrl+Option",
+        hotkey: "Ctrl+Option (⌃⌥)",
         useStreaming: true,
         streamStep: 3000,
         streamLength: 10000
@@ -219,9 +219,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: streamOutputFile)
 
         // Launch whisper-stream with file output
+        guard let streamPath = findExecutable("whisper-stream") else {
+            showNotification(title: "Whisper PTT", body: "❌ whisper-stream not found! Run: brew install whisper-cpp")
+            isRecording = false
+            updateIcon()
+            buildMenu()
+            return
+        }
+
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-stream")
+        process.executableURL = URL(fileURLWithPath: streamPath)
         process.arguments = [
             "-m", config.modelPath,
             "-l", config.language,
@@ -301,7 +309,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Batch Mode (original)
 
+    func findExecutable(_ name: String) -> String? {
+        let paths = [
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)"
+        ]
+        return paths.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
     func startBatchRecording() {
+        guard let soxPath = findExecutable("sox") else {
+            showNotification(title: "Whisper PTT", body: "❌ sox not found! Run: brew install sox")
+            return
+        }
+
         isRecording = true
         updateIcon()
         buildMenu()
@@ -310,12 +332,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(atPath: wavPath)
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/sox")
+        process.executableURL = URL(fileURLWithPath: soxPath)
         process.arguments = ["-d", "-r", "16000", "-c", "1", "-b", "16", wavPath]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
-        recordProcess = process
+
+        do {
+            try process.run()
+            recordProcess = process
+        } catch {
+            showNotification(title: "Whisper PTT", body: "❌ Failed to start recording: \(error.localizedDescription)")
+            isRecording = false
+            updateIcon()
+            buildMenu()
+        }
     }
 
     func stopBatchRecording() {
@@ -356,9 +386,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func transcribeBatch() -> String? {
+        guard let whisperPath = findExecutable("whisper-cli") else {
+            DispatchQueue.main.async {
+                self.showNotification(title: "Whisper PTT", body: "❌ whisper-cli not found! Run: brew install whisper-cpp")
+            }
+            return nil
+        }
+
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-cli")
+        process.executableURL = URL(fileURLWithPath: whisperPath)
         process.arguments = [
             "-m", config.modelPath,
             "-l", config.language,
