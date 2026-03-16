@@ -211,24 +211,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let brewPath = FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/brew")
             ? "/opt/homebrew/bin/brew" : "/usr/local/bin/brew"
 
-        log("Installing: \(deps.joined(separator: ", "))")
+        log("Installing: \(deps.joined(separator: ", ")) using \(brewPath)")
         showNotification(title: "Whisper PTT", body: "⏳ Installing \(deps.joined(separator: ", "))...")
 
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let process = Process()
+            let outPipe = Pipe()
+            let errPipe = Pipe()
             process.executableURL = URL(fileURLWithPath: brewPath)
             process.arguments = ["install"] + deps
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+
+            // Ensure brew can find its deps
+            var env = ProcessInfo.processInfo.environment
+            let brewBin = (brewPath as NSString).deletingLastPathComponent
+            if let path = env["PATH"] {
+                env["PATH"] = "\(brewBin):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(path)"
+            } else {
+                env["PATH"] = "\(brewBin):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            }
+            process.environment = env
 
             do {
                 try process.run()
                 process.waitUntilExit()
+
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let stdout = String(data: outData, encoding: .utf8) ?? ""
+                let stderr = String(data: errData, encoding: .utf8) ?? ""
+
+                if !stdout.isEmpty { self.log("brew stdout: \(stdout.prefix(500))") }
+                if !stderr.isEmpty { self.log("brew stderr: \(stderr.prefix(500))") }
+
                 if process.terminationStatus == 0 {
-                    log("Dependencies installed successfully")
+                    self.log("Dependencies installed successfully")
                     DispatchQueue.main.async {
                         self.showNotification(title: "Whisper PTT", body: "✅ Dependencies installed!")
-                        // Continue setup — check models
                         let models = scanModels()
                         if models.isEmpty {
                             self.showSetupAlert()
@@ -240,13 +260,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                     }
                 } else {
-                    log("brew install failed with code: \(process.terminationStatus)")
+                    self.log("brew install failed (code \(process.terminationStatus)): \(stderr.prefix(300))")
                     DispatchQueue.main.async {
-                        self.showNotification(title: "Whisper PTT", body: "❌ Failed to install. Run manually: brew install \(deps.joined(separator: " "))")
+                        // If it failed but the tools exist now (e.g. already installed warning), continue
+                        let stillMissing = self.checkDependencies()
+                        if stillMissing.isEmpty {
+                            self.log("Dependencies already present despite brew error — continuing")
+                            let models = scanModels()
+                            if models.isEmpty {
+                                self.showSetupAlert()
+                            } else {
+                                self.config.modelPath = models.first!.path
+                                self.config.setupDone = true
+                                self.config.save()
+                                self.buildMenu()
+                            }
+                        } else {
+                            self.showNotification(title: "Whisper PTT", body: "❌ brew install failed. Run manually: brew install \(deps.joined(separator: " "))")
+                        }
                     }
                 }
             } catch {
-                log("ERROR running brew: \(error)")
+                self.log("ERROR running brew: \(error)")
             }
         }
     }
